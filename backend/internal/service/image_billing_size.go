@@ -42,6 +42,9 @@ func ClassifyImageBillingTier(size string) (string, bool) {
 	case "3840x2160", "2160x3840":
 		return ImageBillingSize4K, true
 	}
+	if tier, ok := geminiNativeImageSizeTier(normalized); ok {
+		return tier, true
+	}
 
 	width, height, ok := parseImageBillingDimensions(trimmed)
 	if !ok {

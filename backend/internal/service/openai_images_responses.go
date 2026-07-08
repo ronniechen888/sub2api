@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -333,7 +334,7 @@ func buildOpenAIImagesResponsesRequest(parsed *OpenAIImagesRequest, toolModel st
 		path  string
 		value string
 	}{
-		{path: "size", value: parsed.Size},
+		{path: "size", value: normalizeOpenAIImagesResponsesToolSize(toolModel, parsed.Size)},
 		{path: "quality", value: parsed.Quality},
 		{path: "background", value: parsed.Background},
 		{path: "output_format", value: parsed.OutputFormat},
@@ -373,6 +374,36 @@ func shouldPassOpenAIImagesN(model string, n int) bool {
 		return false
 	}
 	return !strings.EqualFold(strings.TrimSpace(model), "dall-e-3")
+}
+
+func normalizeOpenAIImagesResponsesToolSize(model string, size string) string {
+	size = strings.ToLower(strings.TrimSpace(size))
+	if size == "" || size == "auto" {
+		return size
+	}
+	if !isOpenAIGPTImageModel(model) || strings.EqualFold(strings.TrimSpace(model), "gpt-image-2") || strings.EqualFold(strings.TrimSpace(model), "gpt-image-2-session") {
+		return size
+	}
+	switch size {
+	case "1024x1024", "1024x1536", "1536x1024":
+		return size
+	}
+	parts := strings.Split(size, "x")
+	if len(parts) != 2 {
+		return "1024x1024"
+	}
+	width, widthErr := strconv.Atoi(strings.TrimSpace(parts[0]))
+	height, heightErr := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if widthErr != nil || heightErr != nil || width <= 0 || height <= 0 {
+		return "1024x1024"
+	}
+	if width == height {
+		return "1024x1024"
+	}
+	if width > height {
+		return "1536x1024"
+	}
+	return "1024x1536"
 }
 
 func extractOpenAIImagesFromResponsesCompleted(payload []byte) ([]openAIResponsesImageResult, int64, []byte, openAIResponsesImageResult, error) {
@@ -1151,8 +1182,14 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 	upstreamReq.Header.Set("Accept", "text/event-stream")
 
 	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	if account.ProxyID != nil {
+		if account.Proxy != nil {
+			proxyURL = account.Proxy.URL()
+		} else if s.accountRepo != nil {
+			if fullAcc, err := s.accountRepo.GetByID(ctx, account.ID); err == nil && fullAcc.Proxy != nil {
+				proxyURL = fullAcc.Proxy.URL()
+			}
+		}
 	}
 	upstreamStart := time.Now()
 	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
@@ -1195,7 +1232,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 				RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
 			}
 		}
-		return s.handleErrorResponse(upstreamCtx, resp, c, account, responsesBody)
+		return s.handleOpenAIImagesHTTPError(upstreamCtx, resp, c, account, upstreamReq.URL.String(), respBody, upstreamMsg, responsesBody, requestModel)
 	}
 	defer func() { _ = resp.Body.Close() }()
 

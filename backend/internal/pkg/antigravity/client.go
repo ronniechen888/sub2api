@@ -285,6 +285,14 @@ func NewClient(proxyURL string) (*Client, error) {
 	}, nil
 }
 
+// Do sends an HTTP request using the client's HTTP client
+func (c *Client) Do(req *http.Request) (*http.Response, error) {
+	if c == nil || c.httpClient == nil {
+		return nil, errors.New("client is not initialized")
+	}
+	return c.httpClient.Do(req)
+}
+
 // IsConnectionError 判断是否为连接错误（网络超时、DNS 失败、连接拒绝）
 func IsConnectionError(err error) bool {
 	if err == nil {

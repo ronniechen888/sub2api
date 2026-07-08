@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -19,6 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/geminicli"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
@@ -455,6 +458,10 @@ func applyOpenAIImagesDefaults(req *OpenAIImagesRequest) {
 }
 
 func isOpenAIImageGenerationModel(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gpt-image-") || isImageGenerationModel(model)
+}
+
+func isOpenAIGPTImageModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gpt-image-")
 }
 
@@ -546,6 +553,9 @@ func (s *OpenAIGatewayService) ForwardImages(
 	if parsed == nil {
 		return nil, fmt.Errorf("parsed images request is required")
 	}
+	if account.Platform == PlatformAntigravity || account.Platform == PlatformGemini {
+		return s.forwardGeminiImages(ctx, c, account, body, parsed, channelMappedModel)
+	}
 	switch account.Type {
 	case AccountTypeAPIKey:
 		return s.forwardOpenAIImagesAPIKey(ctx, c, account, body, parsed, channelMappedModel)
@@ -584,7 +594,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 		parsed.Endpoint,
 		account.Type,
 	)
-	forwardBody, forwardContentType, err := rewriteOpenAIImagesModel(body, parsed.ContentType, upstreamModel)
+	forwardBody, forwardContentType, err := rewriteOpenAIImagesRequest(body, parsed.ContentType, upstreamModel)
 	if err != nil {
 		return nil, err
 	}
@@ -601,8 +611,14 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 	}
 
 	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	if account.ProxyID != nil {
+		if account.Proxy != nil {
+			proxyURL = account.Proxy.URL()
+		} else if s.accountRepo != nil {
+			if fullAcc, err := s.accountRepo.GetByID(ctx, account.ID); err == nil && fullAcc.Proxy != nil {
+				proxyURL = fullAcc.Proxy.URL()
+			}
+		}
 	}
 	upstreamStart := time.Now()
 	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
@@ -645,7 +661,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 				RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
 			}
 		}
-		return s.handleErrorResponse(upstreamCtx, resp, c, account, forwardBody)
+		return s.handleOpenAIImagesHTTPError(upstreamCtx, resp, c, account, upstreamReq.URL.String(), respBody, upstreamMsg, forwardBody, upstreamModel)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -692,7 +708,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 			ImageOutputSizes: imageOutputSizes,
 		}, nil
 	} else {
-		nonStreamUsage, nonStreamCount, nonStreamSizes, err := s.handleOpenAIImagesNonStreamingResponse(resp, c)
+		nonStreamUsage, nonStreamCount, nonStreamSizes, err := s.handleOpenAIImagesNonStreamingResponse(resp, c, parsed.ResponseFormat)
 		if err != nil {
 			return nil, err
 		}
@@ -767,24 +783,108 @@ func buildOpenAIImagesURL(base string, endpoint string) string {
 	return buildOpenAIEndpointURL(base, endpoint)
 }
 
-func rewriteOpenAIImagesModel(body []byte, contentType string, model string) ([]byte, string, error) {
+func rewriteOpenAIImagesRequest(body []byte, contentType string, model string) ([]byte, string, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return body, contentType, nil
 	}
 	mediaType, _, err := mime.ParseMediaType(contentType)
 	if err == nil && strings.EqualFold(mediaType, "multipart/form-data") {
-		rewrittenBody, rewrittenType, rewriteErr := rewriteOpenAIImagesMultipartModel(body, contentType, model)
+		rewrittenBody, rewrittenType, rewriteErr := rewriteOpenAIImagesMultipartRequest(body, contentType, model)
 		return rewrittenBody, rewrittenType, rewriteErr
 	}
 	rewritten, err := sjson.SetBytes(body, "model", model)
 	if err != nil {
 		return nil, "", fmt.Errorf("rewrite image request model: %w", err)
 	}
+	if isOpenAIGPTImageModel(model) {
+		if stripped, deleteErr := sjson.DeleteBytes(rewritten, "response_format"); deleteErr == nil {
+			rewritten = stripped
+		}
+		if stripped, deleteErr := sjson.DeleteBytes(rewritten, "style"); deleteErr == nil {
+			rewritten = stripped
+		}
+		if quality := normalizeOpenAIGPTImageQuality(gjson.GetBytes(rewritten, "quality").String()); quality != "" {
+			if next, setErr := sjson.SetBytes(rewritten, "quality", quality); setErr == nil {
+				rewritten = next
+			}
+		}
+	}
 	return rewritten, contentType, nil
 }
 
-func rewriteOpenAIImagesMultipartModel(body []byte, contentType string, model string) ([]byte, string, error) {
+func normalizeOpenAIGPTImageQuality(quality string) string {
+	switch strings.ToLower(strings.TrimSpace(quality)) {
+	case "hd":
+		return "high"
+	case "standard":
+		return "medium"
+	case "low", "medium", "high", "auto":
+		return strings.ToLower(strings.TrimSpace(quality))
+	default:
+		return strings.TrimSpace(quality)
+	}
+}
+
+func (s *OpenAIGatewayService) handleOpenAIImagesHTTPError(
+	ctx context.Context,
+	resp *http.Response,
+	c *gin.Context,
+	account *Account,
+	upstreamURL string,
+	respBody []byte,
+	upstreamMsg string,
+	requestBody []byte,
+	requestedModel string,
+) (*OpenAIForwardResult, error) {
+	upstreamMsg = sanitizeUpstreamErrorMessage(strings.TrimSpace(upstreamMsg))
+	if upstreamMsg == "" {
+		upstreamMsg = sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
+	}
+	if upstreamMsg == "" {
+		upstreamMsg = "Upstream request failed"
+	}
+
+	upstreamDetail := ""
+	if s.cfg != nil && s.cfg.Gateway.LogUpstreamErrorBody {
+		maxBytes := s.cfg.Gateway.LogUpstreamErrorBodyMaxBytes
+		if maxBytes <= 0 {
+			maxBytes = 2048
+		}
+		upstreamDetail = truncateString(string(respBody), maxBytes)
+	}
+	setOpsUpstreamError(c, resp.StatusCode, upstreamMsg, upstreamDetail)
+	logOpenAIInstructionsRequiredDebug(ctx, c, account, resp.StatusCode, upstreamMsg, requestBody, respBody)
+	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+		Platform:           account.Platform,
+		AccountID:          account.ID,
+		AccountName:        account.Name,
+		UpstreamStatusCode: resp.StatusCode,
+		UpstreamRequestID:  resp.Header.Get("x-request-id"),
+		UpstreamURL:        safeUpstreamURL(upstreamURL),
+		Kind:               "http_error",
+		Message:            upstreamMsg,
+		Detail:             upstreamDetail,
+	})
+
+	_ = s.handleOpenAIAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, requestedModel)
+
+	upstreamErr := &OpenAIImagesUpstreamError{
+		StatusCode:        resp.StatusCode,
+		ErrorType:         strings.TrimSpace(gjson.GetBytes(respBody, "error.type").String()),
+		Code:              strings.TrimSpace(gjson.GetBytes(respBody, "error.code").String()),
+		Message:           upstreamMsg,
+		Param:             strings.TrimSpace(gjson.GetBytes(respBody, "error.param").String()),
+		UpstreamRequestID: resp.Header.Get("x-request-id"),
+	}
+	if upstreamErr.ErrorType == "" {
+		upstreamErr.ErrorType = "upstream_error"
+	}
+	writeOpenAIImagesUpstreamErrorResponse(c, upstreamErr)
+	return nil, upstreamErr
+}
+
+func rewriteOpenAIImagesMultipartRequest(body []byte, contentType string, model string) ([]byte, string, error) {
 	_, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		return nil, "", fmt.Errorf("parse multipart content-type: %w", err)
@@ -809,6 +909,14 @@ func rewriteOpenAIImagesMultipartModel(body []byte, contentType string, model st
 		}
 
 		formName := strings.TrimSpace(part.FormName())
+		if isOpenAIGPTImageModel(model) && formName == "response_format" && part.FileName() == "" {
+			_ = part.Close()
+			continue
+		}
+		if isOpenAIGPTImageModel(model) && formName == "style" && part.FileName() == "" {
+			_ = part.Close()
+			continue
+		}
 		partHeader := cloneMultipartHeader(part.Header)
 		target, err := writer.CreatePart(partHeader)
 		if err != nil {
@@ -822,6 +930,15 @@ func rewriteOpenAIImagesMultipartModel(body []byte, contentType string, model st
 				return nil, "", fmt.Errorf("rewrite multipart model: %w", err)
 			}
 			modelWritten = true
+			_ = part.Close()
+			continue
+		}
+		if isOpenAIGPTImageModel(model) && formName == "quality" && part.FileName() == "" {
+			qualityBytes, _ := io.ReadAll(part)
+			if _, err := target.Write([]byte(normalizeOpenAIGPTImageQuality(string(qualityBytes)))); err != nil {
+				_ = part.Close()
+				return nil, "", fmt.Errorf("rewrite multipart quality: %w", err)
+			}
 			_ = part.Close()
 			continue
 		}
@@ -843,6 +960,32 @@ func rewriteOpenAIImagesMultipartModel(body []byte, contentType string, model st
 	return buffer.Bytes(), writer.FormDataContentType(), nil
 }
 
+func rewriteOpenAIImagesResponseForRequestedFormat(body []byte, responseFormat string) []byte {
+	if !strings.EqualFold(strings.TrimSpace(responseFormat), "url") || len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	data := gjson.GetBytes(body, "data")
+	if !data.IsArray() {
+		return body
+	}
+	rewritten := append([]byte(nil), body...)
+	for i, item := range data.Array() {
+		if strings.TrimSpace(item.Get("url").String()) != "" {
+			continue
+		}
+		b64 := strings.TrimSpace(item.Get("b64_json").String())
+		if b64 == "" {
+			continue
+		}
+		mimeType := openAIImageOutputMIMEType(item.Get("output_format").String())
+		next, err := sjson.SetBytes(rewritten, fmt.Sprintf("data.%d.url", i), "data:"+mimeType+";base64,"+b64)
+		if err == nil {
+			rewritten = next
+		}
+	}
+	return rewritten
+}
+
 func cloneMultipartHeader(src textproto.MIMEHeader) textproto.MIMEHeader {
 	dst := make(textproto.MIMEHeader, len(src))
 	for key, values := range src {
@@ -853,11 +996,12 @@ func cloneMultipartHeader(src textproto.MIMEHeader) textproto.MIMEHeader {
 	return dst
 }
 
-func (s *OpenAIGatewayService) handleOpenAIImagesNonStreamingResponse(resp *http.Response, c *gin.Context) (OpenAIUsage, int, []string, error) {
+func (s *OpenAIGatewayService) handleOpenAIImagesNonStreamingResponse(resp *http.Response, c *gin.Context, responseFormat string) (OpenAIUsage, int, []string, error) {
 	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
 	if err != nil {
 		return OpenAIUsage{}, 0, nil, err
 	}
+	body = rewriteOpenAIImagesResponseForRequestedFormat(body, responseFormat)
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 	contentType := "application/json"
 	if s.cfg != nil && !s.cfg.Security.ResponseHeaders.Enabled {
@@ -1607,4 +1751,456 @@ func dedupeStrings(values []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+func (s *OpenAIGatewayService) forwardGeminiImages(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	parsed *OpenAIImagesRequest,
+	channelMappedModel string,
+) (*OpenAIForwardResult, error) {
+	startTime := time.Now()
+	requestModel := strings.TrimSpace(parsed.Model)
+	if mapped := strings.TrimSpace(channelMappedModel); mapped != "" {
+		requestModel = mapped
+	}
+	upstreamModel := account.GetMappedModel(requestModel)
+	if upstreamModel == "" {
+		upstreamModel = requestModel
+	}
+
+	logger.LegacyPrintf(
+		"service.openai_gateway",
+		"[GeminiImage] Images request routing request_model=%s upstream_model=%s endpoint=%s account_type=%s",
+		strings.TrimSpace(parsed.Model),
+		upstreamModel,
+		parsed.Endpoint,
+		account.Type,
+	)
+
+	// Translate OpenAI prompt & size to Gemini image request
+	aspectRatio, geminiImageSize := parseOpenAIImageSizeToGemini(parsed.Size, parsed.Quality)
+
+	var imageParts []any
+	if parsed.IsEdits() || strings.Contains(parsed.Endpoint, "edits") {
+		var imgBytes []byte
+		var mimeType string
+
+		if len(parsed.Uploads) > 0 {
+			imgBytes = parsed.Uploads[0].Data
+			mimeType = parsed.Uploads[0].ContentType
+		} else if len(parsed.InputImageURLs) > 0 {
+			url := parsed.InputImageURLs[0]
+			reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+
+			httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+			if err == nil {
+				resp, err := http.DefaultClient.Do(httpReq)
+				if err == nil {
+					defer resp.Body.Close()
+					if resp.StatusCode == http.StatusOK {
+						data, err := io.ReadAll(resp.Body)
+						if err == nil {
+							imgBytes = data
+							mimeType = resp.Header.Get("Content-Type")
+						}
+					}
+				}
+			}
+		}
+
+		if len(imgBytes) > 0 {
+			if mimeType == "" {
+				mimeType = "image/png"
+			}
+			b64Img := base64.StdEncoding.EncodeToString(imgBytes)
+			imageParts = append(imageParts, map[string]any{
+				"inlineData": map[string]any{
+					"mimeType": mimeType,
+					"data":     b64Img,
+				},
+			})
+		}
+	}
+
+	parts := []any{}
+	for _, p := range imageParts {
+		parts = append(parts, p)
+	}
+	parts = append(parts, map[string]any{
+		"text": parsed.Prompt,
+	})
+
+	geminiReq := map[string]any{
+		"contents": []any{
+			map[string]any{
+				"role":  "user",
+				"parts": parts,
+			},
+		},
+		"generationConfig": map[string]any{
+			"responseModalities": []string{"TEXT", "IMAGE"},
+			"imageConfig": map[string]any{
+				"aspectRatio": aspectRatio,
+				"imageSize":   geminiImageSize,
+			},
+		},
+	}
+
+	var requestBodyBytes []byte
+	var fullURL string
+	var err error
+
+	action := "generateContent"
+	if parsed.Stream {
+		action = "streamGenerateContent"
+	}
+
+	projectID := strings.TrimSpace(account.GetCredential("project_id"))
+	if projectID != "" {
+		// Mode 1: Code Assist API (wrapped)
+		baseURL, err := s.validateUpstreamBaseURL(geminicli.GeminiCliBaseURL)
+		if err != nil {
+			return nil, err
+		}
+		fullURL = fmt.Sprintf("%s/v1internal:%s", strings.TrimRight(baseURL, "/"), action)
+		if parsed.Stream {
+			fullURL += "?alt=sse"
+		}
+
+		wrapped := map[string]any{
+			"model":   upstreamModel,
+			"project": projectID,
+			"request": geminiReq,
+		}
+		requestBodyBytes, _ = json.Marshal(wrapped)
+	} else {
+		// Mode 2: AI Studio API
+		baseURL := account.GetGeminiBaseURL(geminicli.AIStudioBaseURL)
+		normalizedBaseURL, err := s.validateUpstreamBaseURL(baseURL)
+		if err != nil {
+			return nil, err
+		}
+		fullURL = fmt.Sprintf("%s/v1beta/models/%s:%s", strings.TrimRight(normalizedBaseURL, "/"), upstreamModel, action)
+		if parsed.Stream {
+			fullURL += "?alt=sse"
+		}
+		requestBodyBytes, _ = json.Marshal(geminiReq)
+	}
+
+	upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, parsed.Stream)
+	defer releaseUpstreamCtx()
+
+	token, tokenType, err := s.GetAccessToken(upstreamCtx, account)
+	if err != nil {
+		return nil, err
+	}
+
+	upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, fullURL, bytes.NewReader(requestBodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	upstreamReq.Header.Set("Content-Type", "application/json")
+	if account.Type == AccountTypeAPIKey || tokenType == "apikey" {
+		upstreamReq.Header.Set("x-goog-api-key", token)
+	} else {
+		upstreamReq.Header.Set("Authorization", "Bearer "+token)
+	}
+	if projectID != "" {
+		if account.Platform == "antigravity" {
+			upstreamReq.Header.Set("User-Agent", antigravity.GetUserAgentForContext(upstreamCtx))
+		} else {
+			upstreamReq.Header.Set("User-Agent", geminicli.GeminiCLIUserAgent)
+		}
+	}
+
+	proxyURL := ""
+	if account.ProxyID != nil {
+		if account.Proxy != nil {
+			proxyURL = account.Proxy.URL()
+		} else if s.accountRepo != nil {
+			if fullAcc, err := s.accountRepo.GetByID(ctx, account.ID); err == nil && fullAcc.Proxy != nil {
+				proxyURL = fullAcc.Proxy.URL()
+			}
+		}
+	}
+
+	upstreamStart := time.Now()
+	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
+	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
+	if err != nil {
+		safeErr := sanitizeUpstreamErrorMessage(err.Error())
+		setOpsUpstreamError(c, 0, safeErr, "")
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: 0,
+			UpstreamURL:        safeUpstreamURL(upstreamReq.URL.String()),
+			Kind:               "request_error",
+			Message:            safeErr,
+		})
+		return nil, fmt.Errorf("upstream request failed: %s", safeErr)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
+		upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
+		setOpsUpstreamError(c, resp.StatusCode, upstreamMsg, "")
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: resp.StatusCode,
+			UpstreamRequestID:  resp.Header.Get("x-request-id"),
+			UpstreamURL:        safeUpstreamURL(upstreamReq.URL.String()),
+			Kind:               "upstream_error",
+			Message:            upstreamMsg,
+		})
+		upstreamErr := &OpenAIImagesUpstreamError{
+			StatusCode:        resp.StatusCode,
+			ErrorType:         "upstream_error",
+			Message:           upstreamMsg,
+			UpstreamRequestID: resp.Header.Get("x-request-id"),
+		}
+		writeOpenAIImagesUpstreamErrorResponse(c, upstreamErr)
+		return nil, upstreamErr
+	}
+
+	// Read upstream response
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20)) // 32MB max
+	if err != nil {
+		return nil, err
+	}
+
+	var b64Data string
+	var mimeType string
+
+	// Check if SSE stream
+	if isEventStreamResponse(resp.Header) || parsed.Stream {
+		scanner := bufio.NewScanner(bytes.NewReader(respBody))
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "data: ") {
+				dataPayload := strings.TrimPrefix(line, "data: ")
+				if dataPayload == "[DONE]" {
+					continue
+				}
+				res := gjson.Parse(dataPayload)
+				if responseObj := res.Get("response"); responseObj.Exists() {
+					res = responseObj
+				}
+				res.Get("candidates").ForEach(func(key, candidate gjson.Result) bool {
+					candidate.Get("content.parts").ForEach(func(k, part gjson.Result) bool {
+						inline := part.Get("inlineData")
+						if inline.Exists() {
+							b64Data = inline.Get("data").String()
+							mimeType = inline.Get("mimeType").String()
+							return false // stop search
+						}
+						return true
+					})
+					return b64Data == ""
+				})
+			}
+		}
+	} else {
+		// Plain JSON
+		res := gjson.ParseBytes(respBody)
+		if responseObj := res.Get("response"); responseObj.Exists() {
+			res = responseObj
+		}
+		res.Get("candidates").ForEach(func(key, candidate gjson.Result) bool {
+			candidate.Get("content.parts").ForEach(func(k, part gjson.Result) bool {
+				inline := part.Get("inlineData")
+				if inline.Exists() {
+					b64Data = inline.Get("data").String()
+					mimeType = inline.Get("mimeType").String()
+					return false // stop search
+				}
+				return true
+			})
+			return b64Data == ""
+		})
+	}
+
+	if b64Data == "" {
+		return nil, fmt.Errorf("upstream Gemini API did not return any image data")
+	}
+
+	if mimeType == "" {
+		mimeType = "image/png"
+	}
+
+	createdTime := time.Now().Unix()
+	var responseData map[string]any
+
+	format := strings.ToLower(strings.TrimSpace(parsed.ResponseFormat))
+	if format == "url" {
+		dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, b64Data)
+		responseData = map[string]any{
+			"created": createdTime,
+			"data": []any{
+				map[string]any{
+					"url": dataURL,
+				},
+			},
+		}
+	} else {
+		responseData = map[string]any{
+			"created": createdTime,
+			"data": []any{
+				map[string]any{
+					"b64_json": b64Data,
+				},
+			},
+		}
+	}
+
+	responseDataBytes, _ := json.Marshal(responseData)
+	c.Data(http.StatusOK, "application/json; charset=utf-8", responseDataBytes)
+
+	var usage OpenAIUsage
+	return &OpenAIForwardResult{
+		RequestID:        resp.Header.Get("x-request-id"),
+		Usage:            usage,
+		Model:            requestModel,
+		UpstreamModel:    upstreamModel,
+		Stream:           parsed.Stream,
+		ResponseHeaders:  resp.Header.Clone(),
+		Duration:         time.Since(startTime),
+		ImageCount:       1,
+		ImageSize:        parsed.SizeTier,
+		ImageInputSize:   parsed.Size,
+		ImageOutputSizes: []string{parsed.Size},
+	}, nil
+}
+
+func parseOpenAIImageSizeToGemini(size string, preferredTier string) (string, string) {
+	size = strings.ToLower(strings.TrimSpace(size))
+	imageSize := normalizeGeminiImageSizeTier(preferredTier)
+	if imageSize == "" {
+		var ok bool
+		imageSize, ok = geminiNativeImageSizeTier(size)
+		if !ok {
+			imageSize, ok = ClassifyImageBillingTier(size)
+		}
+	}
+	if imageSize == "" {
+		imageSize = "2K" // default
+	}
+
+	if strings.Contains(size, "x") {
+		parts := strings.Split(size, "x")
+		if len(parts) == 2 {
+			w, _ := strconv.Atoi(strings.TrimSpace(parts[0]))
+			h, _ := strconv.Atoi(strings.TrimSpace(parts[1]))
+			if w > 0 && h > 0 {
+				return closestGeminiImageAspectRatio(w, h), imageSize
+			}
+		}
+	}
+	return "1:1", imageSize
+}
+
+func normalizeGeminiImageSizeTier(tier string) string {
+	switch strings.ToUpper(strings.TrimSpace(tier)) {
+	case "1K":
+		return "1K"
+	case "2K":
+		return "2K"
+	case "4K":
+		return "4K"
+	default:
+		return ""
+	}
+}
+
+func geminiNativeImageSizeTier(size string) (string, bool) {
+	tier, ok := geminiNativeImageSizeTiers[strings.ToLower(strings.TrimSpace(size))]
+	return tier, ok
+}
+
+var geminiNativeImageSizeTiers = map[string]string{
+	"1024x1024":  "1K",
+	"2048x2048":  "2K",
+	"4096x4096":  "4K",
+	"512x2048":   "1K",
+	"1024x4096":  "2K",
+	"2048x8192":  "4K",
+	"384x3072":   "1K",
+	"768x6144":   "2K",
+	"1536x12288": "4K",
+	"848x1264":   "1K",
+	"1696x2528":  "2K",
+	"3392x5056":  "4K",
+	"1264x848":   "1K",
+	"2528x1696":  "2K",
+	"5056x3392":  "4K",
+	"896x1200":   "1K",
+	"1792x2400":  "2K",
+	"3584x4800":  "4K",
+	"1200x896":   "1K",
+	"2400x1792":  "2K",
+	"4800x3584":  "4K",
+	"928x1152":   "1K",
+	"1856x2304":  "2K",
+	"3712x4608":  "4K",
+	"1152x928":   "1K",
+	"2304x1856":  "2K",
+	"4608x3712":  "4K",
+	"2048x512":   "1K",
+	"4096x1024":  "2K",
+	"8192x2048":  "4K",
+	"3072x384":   "1K",
+	"6144x768":   "2K",
+	"12288x1536": "4K",
+	"768x1376":   "1K",
+	"1536x2752":  "2K",
+	"3072x5504":  "4K",
+	"1376x768":   "1K",
+	"2752x1536":  "2K",
+	"5504x3072":  "4K",
+	"1584x672":   "1K",
+	"3168x1344":  "2K",
+	"6336x2688":  "4K",
+}
+
+func closestGeminiImageAspectRatio(width, height int) string {
+	requested := float64(width) / float64(height)
+	supported := []struct {
+		value string
+		ratio float64
+	}{
+		{value: "1:1", ratio: 1.0},
+		{value: "1:4", ratio: 1.0 / 4.0},
+		{value: "1:8", ratio: 1.0 / 8.0},
+		{value: "2:3", ratio: 2.0 / 3.0},
+		{value: "3:2", ratio: 3.0 / 2.0},
+		{value: "3:4", ratio: 3.0 / 4.0},
+		{value: "4:3", ratio: 4.0 / 3.0},
+		{value: "4:5", ratio: 4.0 / 5.0},
+		{value: "4:1", ratio: 4.0 / 1.0},
+		{value: "5:4", ratio: 5.0 / 4.0},
+		{value: "8:1", ratio: 8.0 / 1.0},
+		{value: "9:16", ratio: 9.0 / 16.0},
+		{value: "16:9", ratio: 16.0 / 9.0},
+		{value: "21:9", ratio: 21.0 / 9.0},
+	}
+
+	best := supported[0]
+	bestDistance := math.Abs(math.Log(requested / best.ratio))
+	for _, candidate := range supported[1:] {
+		distance := math.Abs(math.Log(requested / candidate.ratio))
+		if distance < bestDistance {
+			best = candidate
+			bestDistance = distance
+		}
+	}
+	return best.value
 }

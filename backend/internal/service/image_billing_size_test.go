@@ -20,6 +20,9 @@ func TestClassifyImageBillingTier(t *testing.T) {
 		{name: "long edge 1k", size: "1024X768", wantTier: "1K", wantOK: true},
 		{name: "long edge 2k", size: "1280x768", wantTier: "2K", wantOK: true},
 		{name: "long edge 4k", size: "2560x1600", wantTier: "4K", wantOK: true},
+		{name: "gemini pro 21:9 1k native", size: "1584x672", wantTier: "1K", wantOK: true},
+		{name: "gemini pro 21:9 2k native", size: "3168x1344", wantTier: "2K", wantOK: true},
+		{name: "gemini pro 21:9 4k native", size: "6336x2688", wantTier: "4K", wantOK: true},
 		{name: "tier string 1k", size: "1k", wantTier: "1K", wantOK: true},
 		{name: "empty", size: "", wantOK: false},
 		{name: "auto", size: "auto", wantOK: false},
@@ -57,6 +60,12 @@ func TestResolveImageBillingSize(t *testing.T) {
 		{
 			name:        "input fallback",
 			inputSize:   "1024x1024",
+			wantBilling: "1K",
+			wantSource:  ImageSizeSourceInput,
+		},
+		{
+			name:        "gemini native input fallback",
+			inputSize:   "1584x672",
 			wantBilling: "1K",
 			wantSource:  ImageSizeSourceInput,
 		},

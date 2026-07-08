@@ -403,14 +403,54 @@ func TestResolveOpenAIImageBytes_PrefersInlineBase64(t *testing.T) {
 	require.Equal(t, []byte("ABC"), data)
 }
 
-func TestAccountSupportsOpenAIImageCapability_OAuthSupportsNative(t *testing.T) {
+func TestAccountSupportsOpenAIImageCapability_OpenAIOAuthOnlySupportsBasic(t *testing.T) {
 	account := &Account{
 		Platform: PlatformOpenAI,
 		Type:     AccountTypeOAuth,
 	}
 
 	require.True(t, account.SupportsOpenAIImageCapability(OpenAIImagesCapabilityBasic))
+	require.False(t, account.SupportsOpenAIImageCapability(OpenAIImagesCapabilityNative))
+}
+
+func TestAccountSupportsOpenAIImageCapability_OpenAIAPIKeySupportsNative(t *testing.T) {
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+	}
+
+	require.True(t, account.SupportsOpenAIImageCapability(OpenAIImagesCapabilityBasic))
 	require.True(t, account.SupportsOpenAIImageCapability(OpenAIImagesCapabilityNative))
+}
+
+func TestAccountIsModelSupported_AllowsOpenAIGPTImageFamilyMapping(t *testing.T) {
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"model_mapping": map[string]any{
+				"gpt-image-2": "gpt-image-2",
+				"gpt-5.4":     "gpt-5.4",
+			},
+		},
+	}
+
+	require.True(t, account.IsModelSupported("gpt-image-1-mini"))
+	require.False(t, account.IsModelSupported("gpt-unknown"))
+}
+
+func TestAccountIsModelSupported_TextOnlyMappingDoesNotAllowOpenAIGPTImageFamily(t *testing.T) {
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"model_mapping": map[string]any{
+				"gpt-5.4": "gpt-5.4",
+			},
+		},
+	}
+
+	require.False(t, account.IsModelSupported("gpt-image-1-mini"))
 }
 
 func TestAccountSupportsOpenAIEndpointCapability(t *testing.T) {
@@ -733,6 +773,204 @@ func TestOpenAIGatewayServiceForwardImages_APIKeyGenerationUsesConfiguredV1BaseU
 	require.Equal(t, "gpt-image-2", gjson.GetBytes(upstream.lastBody, "model").String())
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, "aGVsbG8=", gjson.Get(rec.Body.String(), "data.0.b64_json").String())
+}
+
+func TestOpenAIGatewayServiceForwardImages_APIKeyNormalizesGPTImageLegacyOptionsAndReturnsDataURL(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"gpt-image-2","prompt":"draw a cat","response_format":"url","output_format":"png","quality":"hd","style":"vivid"}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+
+	svc := &OpenAIGatewayService{
+		cfg: &config.Config{},
+		httpUpstream: &httpUpstreamRecorder{
+			resp: &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"created":1710000007,"data":[{"b64_json":"aGVsbG8=","output_format":"png"}]}`)),
+			},
+		},
+	}
+	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+	require.NoError(t, err)
+
+	account := &Account{
+		ID:       6,
+		Name:     "openai-apikey",
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key": "test-api-key",
+		},
+	}
+
+	result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	upstream, ok := svc.httpUpstream.(*httpUpstreamRecorder)
+	require.True(t, ok)
+	require.False(t, gjson.GetBytes(upstream.lastBody, "response_format").Exists())
+	require.False(t, gjson.GetBytes(upstream.lastBody, "style").Exists())
+	require.Equal(t, "high", gjson.GetBytes(upstream.lastBody, "quality").String())
+	require.Equal(t, "png", gjson.GetBytes(upstream.lastBody, "output_format").String())
+	require.Equal(t, "data:image/png;base64,aGVsbG8=", gjson.Get(rec.Body.String(), "data.0.url").String())
+	require.Equal(t, "aGVsbG8=", gjson.Get(rec.Body.String(), "data.0.b64_json").String())
+}
+
+func TestOpenAIGatewayServiceForwardImages_APIKeyUpstreamUserErrorIsExposed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"gpt-image-2","prompt":"draw a cat","quality":"hd"}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+
+	svc := &OpenAIGatewayService{
+		cfg: &config.Config{},
+		httpUpstream: &httpUpstreamRecorder{
+			resp: &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Header:     http.Header{"X-Request-Id": []string{"req_bad_quality"}},
+				Body: io.NopCloser(strings.NewReader(`{
+					"error":{
+						"message":"Invalid value: 'hd'. Supported values are: 'low', 'medium', 'high'.",
+						"type":"invalid_request_error",
+						"code":"invalid_value",
+						"param":"quality"
+					}
+				}`)),
+			},
+		},
+	}
+	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+	require.NoError(t, err)
+
+	account := &Account{
+		ID:       9,
+		Name:     "openai-apikey",
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key": "test-api-key",
+		},
+	}
+
+	result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
+	require.Nil(t, result)
+	var upstreamErr *OpenAIImagesUpstreamError
+	require.ErrorAs(t, err, &upstreamErr)
+	require.Equal(t, http.StatusBadRequest, upstreamErr.StatusCode)
+	require.Equal(t, "invalid_request_error", upstreamErr.ErrorType)
+	require.Equal(t, "invalid_value", upstreamErr.Code)
+	require.Equal(t, "quality", upstreamErr.Param)
+	require.Contains(t, upstreamErr.Message, "Invalid value")
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, gjson.Get(rec.Body.String(), "error.message").String(), "Invalid value")
+	require.Equal(t, "invalid_request_error", gjson.Get(rec.Body.String(), "error.type").String())
+	require.Equal(t, "invalid_value", gjson.Get(rec.Body.String(), "error.code").String())
+	require.Equal(t, "quality", gjson.Get(rec.Body.String(), "error.param").String())
+}
+
+func TestOpenAIGatewayServiceForwardImages_GeminiAPIKeyUsesGoogAPIKeyHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"gemini-2.5-flash-image","prompt":"draw a cat","response_format":"b64_json","size":"1024x1024"}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+
+	svc := &OpenAIGatewayService{
+		cfg: &config.Config{},
+		httpUpstream: &httpUpstreamRecorder{
+			resp: &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type": []string{"application/json"},
+					"X-Request-Id": []string{"req_gemini_img"},
+				},
+				Body: io.NopCloser(strings.NewReader(`{"candidates":[{"content":{"parts":[{"text":"ok"},{"inlineData":{"mimeType":"image/png","data":"aGVsbG8="}}]}}]}`)),
+			},
+		},
+	}
+	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+	require.NoError(t, err)
+
+	account := &Account{
+		ID:       7,
+		Name:     "gemini-apikey",
+		Platform: PlatformGemini,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key":  "gemini-api-key",
+			"base_url": "https://generativelanguage.googleapis.com",
+		},
+	}
+
+	result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, 1, result.ImageCount)
+	require.Equal(t, "gemini-2.5-flash-image", result.Model)
+	require.Equal(t, "gemini-2.5-flash-image", result.UpstreamModel)
+
+	upstream, ok := svc.httpUpstream.(*httpUpstreamRecorder)
+	require.True(t, ok)
+	require.NotNil(t, upstream.lastReq)
+	require.Equal(t, "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent", upstream.lastReq.URL.String())
+	require.Equal(t, "gemini-api-key", upstream.lastReq.Header.Get("x-goog-api-key"))
+	require.Empty(t, upstream.lastReq.Header.Get("Authorization"))
+	require.Equal(t, "IMAGE", gjson.GetBytes(upstream.lastBody, "generationConfig.responseModalities.1").String())
+	require.Equal(t, "aGVsbG8=", gjson.Get(rec.Body.String(), "data.0.b64_json").String())
+}
+
+func TestOpenAIGatewayServiceForwardImages_GeminiUpstreamErrorIsTyped(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"gemini-2.5-flash-image","prompt":"draw a cat"}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+
+	svc := &OpenAIGatewayService{
+		cfg: &config.Config{},
+		httpUpstream: &httpUpstreamRecorder{
+			resp: &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Header:     http.Header{"X-Request-Id": []string{"req_gemini_401"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"API key not valid"}}`)),
+			},
+		},
+	}
+	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+	require.NoError(t, err)
+
+	account := &Account{
+		ID:       8,
+		Name:     "gemini-apikey",
+		Platform: PlatformGemini,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key": "bad-key",
+		},
+	}
+
+	result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
+	require.Nil(t, result)
+	var upstreamErr *OpenAIImagesUpstreamError
+	require.ErrorAs(t, err, &upstreamErr)
+	require.Equal(t, http.StatusUnauthorized, upstreamErr.StatusCode)
+	require.Contains(t, upstreamErr.Message, "API key not valid")
 }
 
 func TestOpenAIGatewayServiceForwardImages_APIKeyStreamJSONResponseBillsImage(t *testing.T) {
@@ -1272,6 +1510,108 @@ func TestBuildOpenAIImagesResponsesRequest_DoesNotPassNForDallE3(t *testing.T) {
 	require.NotNil(t, body)
 	require.False(t, gjson.GetBytes(body, "tools.0.n").Exists())
 	require.Equal(t, "dall-e-3", gjson.GetBytes(body, "tools.0.model").String())
+}
+
+func TestBuildOpenAIImagesResponsesRequest_NormalizesGPTImage15Size(t *testing.T) {
+	tests := []struct {
+		name string
+		size string
+		want string
+	}{
+		{name: "legacy landscape", size: "1792x1024", want: "1536x1024"},
+		{name: "legacy portrait", size: "1024x1792", want: "1024x1536"},
+		{name: "square", size: "2048x2048", want: "1024x1024"},
+		{name: "supported landscape", size: "1536x1024", want: "1536x1024"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsed := &OpenAIImagesRequest{
+				Endpoint: openAIImagesGenerationsEndpoint,
+				Model:    "gpt-image-1.5",
+				Prompt:   "draw a cat",
+				Size:     tt.size,
+				N:        1,
+			}
+
+			body, err := buildOpenAIImagesResponsesRequest(parsed, "gpt-image-1.5")
+			require.NoError(t, err)
+			require.Equal(t, tt.want, gjson.GetBytes(body, "tools.0.size").String())
+		})
+	}
+}
+
+func TestBuildOpenAIImagesResponsesRequest_PreservesGPTImage2Size(t *testing.T) {
+	parsed := &OpenAIImagesRequest{
+		Endpoint: openAIImagesGenerationsEndpoint,
+		Model:    "gpt-image-2",
+		Prompt:   "draw a cat",
+		Size:     "1792x1024",
+		N:        1,
+	}
+
+	body, err := buildOpenAIImagesResponsesRequest(parsed, "gpt-image-2")
+	require.NoError(t, err)
+	require.Equal(t, "1792x1024", gjson.GetBytes(body, "tools.0.size").String())
+}
+
+func TestParseOpenAIImageSizeToGemini_MapsImageAppSizesToClosestAspectRatio(t *testing.T) {
+	tests := []struct {
+		size      string
+		wantRatio string
+		wantTier  string
+	}{
+		{size: "1024x1024", wantRatio: "1:1", wantTier: "1K"},
+		{size: "1792x1024", wantRatio: "16:9", wantTier: "2K"},
+		{size: "1024x1792", wantRatio: "9:16", wantTier: "2K"},
+		{size: "1152x864", wantRatio: "4:3", wantTier: "2K"},
+		{size: "864x1152", wantRatio: "3:4", wantTier: "2K"},
+		{size: "2048x872", wantRatio: "21:9", wantTier: "2K"},
+		{size: "872x2048", wantRatio: "9:16", wantTier: "2K"},
+		{size: "1248x832", wantRatio: "3:2", wantTier: "2K"},
+		{size: "832x1248", wantRatio: "2:3", wantTier: "2K"},
+		{size: "864x1080", wantRatio: "4:5", wantTier: "2K"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.size, func(t *testing.T) {
+			gotRatio, gotTier := parseOpenAIImageSizeToGemini(tt.size, "")
+			require.Equal(t, tt.wantRatio, gotRatio)
+			require.Equal(t, tt.wantTier, gotTier)
+		})
+	}
+}
+
+func TestParseOpenAIImageSizeToGemini_MapsImageAppGeminiProNativeSizes(t *testing.T) {
+	rows := []struct {
+		ratio string
+		sizes map[string]string
+	}{
+		{ratio: "1:1", sizes: map[string]string{"1K": "1024x1024", "2K": "2048x2048", "4K": "4096x4096"}},
+		{ratio: "2:3", sizes: map[string]string{"1K": "848x1264", "2K": "1696x2528", "4K": "3392x5056"}},
+		{ratio: "3:2", sizes: map[string]string{"1K": "1264x848", "2K": "2528x1696", "4K": "5056x3392"}},
+		{ratio: "3:4", sizes: map[string]string{"1K": "896x1200", "2K": "1792x2400", "4K": "3584x4800"}},
+		{ratio: "4:3", sizes: map[string]string{"1K": "1200x896", "2K": "2400x1792", "4K": "4800x3584"}},
+		{ratio: "4:5", sizes: map[string]string{"1K": "928x1152", "2K": "1856x2304", "4K": "3712x4608"}},
+		{ratio: "5:4", sizes: map[string]string{"1K": "1152x928", "2K": "2304x1856", "4K": "4608x3712"}},
+		{ratio: "9:16", sizes: map[string]string{"1K": "768x1376", "2K": "1536x2752", "4K": "3072x5504"}},
+		{ratio: "16:9", sizes: map[string]string{"1K": "1376x768", "2K": "2752x1536", "4K": "5504x3072"}},
+		{ratio: "21:9", sizes: map[string]string{"1K": "1584x672", "2K": "3168x1344", "4K": "6336x2688"}},
+	}
+
+	for _, row := range rows {
+		for tier, size := range row.sizes {
+			t.Run(row.ratio+"_"+tier, func(t *testing.T) {
+				gotRatio, gotTier := parseOpenAIImageSizeToGemini(size, tier)
+				require.Equal(t, row.ratio, gotRatio)
+				require.Equal(t, tier, gotTier)
+
+				gotRatio, gotTier = parseOpenAIImageSizeToGemini(size, "")
+				require.Equal(t, row.ratio, gotRatio)
+				require.Equal(t, tier, gotTier)
+			})
+		}
+	}
 }
 
 func TestBuildOpenAIImagesResponsesRequest_StripsInputFidelity(t *testing.T) {

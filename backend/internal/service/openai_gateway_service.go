@@ -334,10 +334,12 @@ type OpenAIGatewayService struct {
 	rateLimitService      *RateLimitService
 	billingCacheService   *BillingCacheService
 	userGroupRateResolver *userGroupRateResolver
-	httpUpstream          HTTPUpstream
-	deferredService       *DeferredService
-	openAITokenProvider   *OpenAITokenProvider
-	toolCorrector         *CodexToolCorrector
+	httpUpstream             HTTPUpstream
+	deferredService          *DeferredService
+	openAITokenProvider      *OpenAITokenProvider
+	antigravityTokenProvider *AntigravityTokenProvider
+	geminiTokenProvider      *GeminiTokenProvider
+	toolCorrector            *CodexToolCorrector
 	openaiWSResolver      OpenAIWSProtocolResolver
 	resolver              *ModelPricingResolver
 	channelService        *ChannelService
@@ -384,6 +386,8 @@ func NewOpenAIGatewayService(
 	httpUpstream HTTPUpstream,
 	deferredService *DeferredService,
 	openAITokenProvider *OpenAITokenProvider,
+	antigravityTokenProvider *AntigravityTokenProvider,
+	geminiTokenProvider *GeminiTokenProvider,
 	resolver *ModelPricingResolver,
 	channelService *ChannelService,
 	balanceNotifyService *BalanceNotifyService,
@@ -412,9 +416,11 @@ func NewOpenAIGatewayService(
 			"service.openai_gateway",
 		),
 		httpUpstream:          httpUpstream,
-		deferredService:       deferredService,
-		openAITokenProvider:   openAITokenProvider,
-		toolCorrector:         NewCodexToolCorrector(),
+		deferredService:          deferredService,
+		openAITokenProvider:      openAITokenProvider,
+		antigravityTokenProvider: antigravityTokenProvider,
+		geminiTokenProvider:      geminiTokenProvider,
+		toolCorrector:            NewCodexToolCorrector(),
 		openaiWSResolver:      NewOpenAIWSProtocolResolver(cfg),
 		resolver:              resolver,
 		channelService:        channelService,
@@ -1324,7 +1330,12 @@ func openAICompactSupportTier(account *Account) int {
 // isOpenAIAccountEligibleForRequest centralises the schedulable / OpenAI / model /
 // compact-support checks used during account selection.
 func isOpenAIAccountEligibleForRequest(ctx context.Context, account *Account, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) bool {
-	if account == nil || !account.IsOpenAI() || !account.IsSchedulableForModelWithContext(ctx, requestedModel) {
+	if account == nil {
+		return false
+	}
+	isImage := isImageGenerationModel(requestedModel)
+	isEligiblePlatform := account.IsOpenAI() || (isImage && (account.Platform == PlatformAntigravity || account.Platform == PlatformGemini))
+	if !isEligiblePlatform || !account.IsSchedulableForModelWithContext(ctx, requestedModel) {
 		return false
 	}
 	if paused, reason := shouldAutoPauseOpenAIAccountByQuota(ctx, account); paused {
@@ -1602,7 +1613,7 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 
 	// 2. 获取可调度的 OpenAI 账号
 	// Get schedulable OpenAI accounts
-	accounts, err := s.listSchedulableAccounts(ctx, groupID)
+	accounts, err := s.listSchedulableAccounts(ctx, groupID, requestedModel)
 	if err != nil {
 		return nil, fmt.Errorf("query accounts failed: %w", err)
 	}
@@ -1840,7 +1851,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		})
 	}
 
-	accounts, err := s.listSchedulableAccounts(ctx, groupID)
+	accounts, err := s.listSchedulableAccounts(ctx, groupID, requestedModel)
 	if err != nil {
 		return nil, err
 	}
@@ -2100,24 +2111,33 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	return nil, ErrNoAvailableAccounts
 }
 
-func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, groupID *int64) ([]Account, error) {
-	if s.schedulerSnapshot != nil {
-		accounts, _, err := s.schedulerSnapshot.ListSchedulableAccounts(ctx, groupID, PlatformOpenAI, false)
-		return accounts, err
+func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, groupID *int64, requestedModel string) ([]Account, error) {
+	platforms := []string{PlatformOpenAI}
+	if isImageGenerationModel(requestedModel) {
+		platforms = []string{PlatformOpenAI, PlatformAntigravity, PlatformGemini}
 	}
-	var accounts []Account
-	var err error
-	if s.cfg != nil && s.cfg.RunMode == config.RunModeSimple {
-		accounts, err = s.accountRepo.ListSchedulableByPlatform(ctx, PlatformOpenAI)
-	} else if groupID != nil {
-		accounts, err = s.accountRepo.ListSchedulableByGroupIDAndPlatform(ctx, *groupID, PlatformOpenAI)
-	} else {
-		accounts, err = s.accountRepo.ListSchedulableUngroupedByPlatform(ctx, PlatformOpenAI)
+
+	var allAccounts []Account
+	for _, platform := range platforms {
+		var accounts []Account
+		var err error
+		if s.schedulerSnapshot != nil {
+			accounts, _, err = s.schedulerSnapshot.ListSchedulableAccounts(ctx, groupID, platform, false)
+		} else {
+			if s.cfg != nil && s.cfg.RunMode == config.RunModeSimple {
+				accounts, err = s.accountRepo.ListSchedulableByPlatform(ctx, platform)
+			} else if groupID != nil {
+				accounts, err = s.accountRepo.ListSchedulableByGroupIDAndPlatform(ctx, *groupID, platform)
+			} else {
+				accounts, err = s.accountRepo.ListSchedulableUngroupedByPlatform(ctx, platform)
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("query accounts for platform %s failed: %w", platform, err)
+		}
+		allAccounts = append(allAccounts, accounts...)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("query accounts failed: %w", err)
-	}
-	return accounts, nil
+	return allAccounts, nil
 }
 
 func (s *OpenAIGatewayService) tryAcquireAccountSlot(ctx context.Context, accountID int64, maxConcurrency int) (*AcquireResult, error) {
@@ -2241,6 +2261,43 @@ func (s *OpenAIGatewayService) schedulingConfig() config.GatewaySchedulingConfig
 
 // GetAccessToken gets the access token for an OpenAI account
 func (s *OpenAIGatewayService) GetAccessToken(ctx context.Context, account *Account) (string, string, error) {
+	if account == nil {
+		return "", "", errors.New("account is nil")
+	}
+	if account.Platform == PlatformAntigravity {
+		if account.Type == AccountTypeOAuth {
+			if s.antigravityTokenProvider == nil {
+				return "", "", errors.New("antigravity token provider not configured")
+			}
+			accessToken, err := s.antigravityTokenProvider.GetAccessToken(ctx, account)
+			if err != nil {
+				return "", "", err
+			}
+			return accessToken, "oauth", nil
+		}
+		apiKey := account.GetCredential("api_key")
+		if apiKey == "" {
+			return "", "", errors.New("api_key not found in credentials")
+		}
+		return apiKey, "apikey", nil
+	}
+	if account.Platform == PlatformGemini {
+		if account.Type == AccountTypeOAuth {
+			if s.geminiTokenProvider == nil {
+				return "", "", errors.New("gemini token provider not configured")
+			}
+			accessToken, err := s.geminiTokenProvider.GetAccessToken(ctx, account)
+			if err != nil {
+				return "", "", err
+			}
+			return accessToken, "oauth", nil
+		}
+		apiKey := account.GetCredential("api_key")
+		if apiKey == "" {
+			return "", "", errors.New("api_key not found in credentials")
+		}
+		return apiKey, "apikey", nil
+	}
 	switch account.Type {
 	case AccountTypeOAuth:
 		// 使用 TokenProvider 获取缓存的 token

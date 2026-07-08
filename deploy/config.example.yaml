@@ -155,9 +155,9 @@ gateway:
   # Max request body size in bytes (default: 256MB)
   # 请求体最大字节数（默认 256MB）
   max_body_size: 268435456
-  # Max bytes to read for non-stream upstream responses (default: 8MB)
-  # 非流式上游响应体读取上限（默认 8MB）
-  upstream_response_read_max_bytes: 8388608
+  # Max bytes to read for non-stream upstream responses (default: 64MiB)
+  # 非流式上游响应体读取上限（默认 64MiB）
+  upstream_response_read_max_bytes: 67108864
   # Max bytes to read for proxy probe responses (default: 1MB)
   # 代理探测响应体读取上限（默认 1MB）
   proxy_probe_response_read_max_bytes: 1048576
@@ -213,6 +213,14 @@ gateway:
   # 默认 false：保持纯文本 Codex 请求不被改写；客户端显式提供 image_generation tool 时，
   # 仍会在分组允许图片生成的情况下正常转发。
   codex_image_generation_bridge_enabled: false
+  # Allow OpenAI image native requests to fall back to OAuth when no API Key account is available.
+  # 是否允许 OpenAI 图片 native 请求在没有 API Key 账号时回退到 OAuth。
+  #
+  # Default true supports deployments that only have OpenAI OAuth accounts.
+  # Set false if you want image requests to use official API Key accounts only.
+  # 默认 true：支持只有 OpenAI OAuth 账号的部署。
+  # 如果希望图片请求只走官方 API Key 账号，可设为 false。
+  openai_images_allow_oauth_fallback: true
   # Optional: template file used to build the final top-level Codex `instructions`.
   # 可选：用于构建最终 Codex 顶层 `instructions` 的模板文件路径。
   #

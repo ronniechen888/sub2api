@@ -607,6 +607,18 @@ func mappingSupportsRequestedModel(mapping map[string]string, requestedModel str
 	return false
 }
 
+func mappingSupportsOpenAIGPTImageFamily(mapping map[string]string, requestedModel string) bool {
+	if !isOpenAIGPTImageModel(requestedModel) {
+		return false
+	}
+	for key, value := range mapping {
+		if isOpenAIGPTImageModel(key) || isOpenAIGPTImageModel(value) || matchWildcard(key, requestedModel) {
+			return true
+		}
+	}
+	return false
+}
+
 func resolveRequestedModelInMapping(mapping map[string]string, requestedModel string) (mappedModel string, matched bool) {
 	if requestedModel == "" {
 		return "", false
@@ -625,6 +637,9 @@ func (a *Account) IsModelSupported(requestedModel string) bool {
 		return true // 无映射 = 允许所有
 	}
 	if mappingSupportsRequestedModel(mapping, requestedModel) {
+		return true
+	}
+	if a.IsOpenAI() && mappingSupportsOpenAIGPTImageFamily(mapping, requestedModel) {
 		return true
 	}
 	normalized := normalizeRequestedModelForLookup(a.Platform, requestedModel)
@@ -1206,12 +1221,17 @@ func (a *Account) openAIEndpointCapabilitySet() (map[string]bool, bool) {
 }
 
 func (a *Account) SupportsOpenAIImageCapability(capability OpenAIImagesCapability) bool {
-	if !a.IsOpenAI() {
+	if !a.IsOpenAI() && a.Platform != PlatformAntigravity && a.Platform != PlatformGemini {
 		return false
 	}
 	switch capability {
-	case OpenAIImagesCapabilityBasic, OpenAIImagesCapabilityNative:
+	case OpenAIImagesCapabilityBasic:
 		return a.Type == AccountTypeOAuth || a.Type == AccountTypeAPIKey
+	case OpenAIImagesCapabilityNative:
+		if a.Platform == PlatformAntigravity || a.Platform == PlatformGemini {
+			return a.Type == AccountTypeOAuth || a.Type == AccountTypeAPIKey
+		}
+		return a.Type == AccountTypeAPIKey
 	default:
 		return true
 	}
