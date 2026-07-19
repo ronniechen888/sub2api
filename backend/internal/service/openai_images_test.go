@@ -1668,6 +1668,25 @@ func TestCollectOpenAIImagesFromResponsesBody_MultilineSSE(t *testing.T) {
 	require.JSONEq(t, `{"images":1}`, string(usageRaw))
 }
 
+func TestCollectOpenAIImagesFromResponsesBody_AssistantSafetyRefusal(t *testing.T) {
+	body := []byte(
+		"data: {\"type\":\"response.created\",\"response\":{\"created_at\":1710000004}}\n\n" +
+			"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"msg_123\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"I cannot help generate violent images. Let me know if you would like something else.\"}]}}\n\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"created_at\":1710000004,\"output\":[]}}\n\n" +
+			"data: [DONE]\n\n",
+	)
+
+	results, _, _, _, _, err := collectOpenAIImagesFromResponsesBody(body)
+	require.NoError(t, err)
+	require.Len(t, results, 0)
+
+	upstreamErr := extractOpenAIImagesUpstreamError(body)
+	require.NotNil(t, upstreamErr)
+	require.Equal(t, http.StatusBadRequest, upstreamErr.StatusCode)
+	require.Equal(t, "content_policy_violation", upstreamErr.Code)
+	require.Contains(t, upstreamErr.Message, "I cannot help generate violent images.")
+}
+
 func TestOpenAIGatewayServiceForwardImages_OAuthStreamingHandlesOutputItemDoneFallback(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := []byte(`{"model":"gpt-image-2","prompt":"draw a cat","stream":true,"response_format":"url"}`)

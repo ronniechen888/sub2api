@@ -561,13 +561,37 @@ func collectOpenAIImagesFromResponsesBody(body []byte) ([]openAIResponsesImageRe
 
 func extractOpenAIImagesUpstreamError(body []byte) *OpenAIImagesUpstreamError {
 	var upstreamErr *OpenAIImagesUpstreamError
+	var assistantText string
 	forEachOpenAISSEDataPayload(string(body), func(payload []byte) {
-		if upstreamErr != nil || !gjson.ValidBytes(payload) {
+		if !gjson.ValidBytes(payload) {
 			return
 		}
-		upstreamErr = openAIImagesUpstreamErrorFromSSEPayload(payload)
+		if upstreamErr == nil {
+			upstreamErr = openAIImagesUpstreamErrorFromSSEPayload(payload)
+		}
+		if gjson.GetBytes(payload, "type").String() == "response.output_item.done" {
+			item := gjson.GetBytes(payload, "item")
+			if item.Exists() && item.Get("type").String() == "message" && item.Get("role").String() == "assistant" {
+				text := strings.TrimSpace(item.Get("content.0.text").String())
+				if text != "" {
+					assistantText = text
+				}
+			}
+		}
 	})
-	return upstreamErr
+	if upstreamErr != nil {
+		return upstreamErr
+	}
+	if assistantText != "" {
+		return &OpenAIImagesUpstreamError{
+			StatusCode:        http.StatusBadRequest,
+			ErrorType:         "invalid_request_error",
+			Code:              "content_policy_violation",
+			Message:           "Your request was rejected as a result of our safety system: " + assistantText,
+			UpstreamRequestID: "",
+		}
+	}
+	return nil
 }
 
 func openAIImagesUpstreamErrorFromSSEPayload(payload []byte) *OpenAIImagesUpstreamError {
@@ -826,6 +850,7 @@ func (s *OpenAIGatewayService) handleOpenAIImagesOAuthStreamingResponse(
 	var sseData openAISSEDataAccumulator
 	var processDataErr error
 	processDataDone := false
+	var assistantText string
 
 	processData := func(dataBytes []byte) {
 		if processDataDone || processDataErr != nil {
@@ -875,6 +900,13 @@ func (s *OpenAIGatewayService) handleOpenAIImagesOAuthStreamingResponse(
 				return
 			}
 			if !ok {
+				item := gjson.GetBytes(dataBytes, "item")
+				if item.Exists() && item.Get("type").String() == "message" && item.Get("role").String() == "assistant" {
+					text := strings.TrimSpace(item.Get("content.0.text").String())
+					if text != "" {
+						assistantText = text
+					}
+				}
 				return
 			}
 			mergeOpenAIResponsesImageMeta(&streamMeta, img)
@@ -908,8 +940,22 @@ func (s *OpenAIGatewayService) handleOpenAIImagesOAuthStreamingResponse(
 				appendOpenAIResponsesImageResultDedup(&finalResults, finalSeen, "", img)
 			}
 			if len(finalResults) == 0 {
-				outputErr := fmt.Errorf("upstream did not return image output")
-				s.tryWriteOpenAIImagesStreamEvent(c, flusher, &clientDisconnected, &lastDownstreamWriteAt, "error", buildOpenAIImagesStreamErrorBody(outputErr.Error()))
+				var outputErr error
+				if assistantText != "" {
+					upstreamErr := &OpenAIImagesUpstreamError{
+						StatusCode:        http.StatusBadRequest,
+						ErrorType:         "invalid_request_error",
+						Code:              "content_policy_violation",
+						Message:           "Your request was rejected as a result of our safety system: " + assistantText,
+						UpstreamRequestID: "",
+					}
+					s.tryWriteOpenAIImagesStreamEvent(c, flusher, &clientDisconnected, &lastDownstreamWriteAt, "error", buildOpenAIImagesStreamErrorBodyFromUpstream(upstreamErr))
+					setOpsUpstreamError(c, upstreamErr.clientStatusCode(), upstreamErr.clientMessage(), "")
+					outputErr = upstreamErr
+				} else {
+					outputErr = fmt.Errorf("upstream did not return image output")
+					s.tryWriteOpenAIImagesStreamEvent(c, flusher, &clientDisconnected, &lastDownstreamWriteAt, "error", buildOpenAIImagesStreamErrorBody(outputErr.Error()))
+				}
 				processDataErr = outputErr
 				processDataDone = true
 				return
